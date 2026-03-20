@@ -14,4 +14,7 @@ __pycache__/
 .vscode/
 alembic/versions/*.pyc
 
-fansonly.sql/
+/fansonly.sql
+/olddb.dump
+/dump.sql
+/alembic.ini

@@ -126,8 +126,17 @@ from fastapi import UploadFile
 from google.cloud import storage
 from PIL import Image
 
-PHOTO_MIME_TYPES = {"image/jpeg", "image/jpg", "image/png", "image/webp"}
-VIDEO_MIME_TYPES = {"video/mp4", "video/quicktime", "video/x-msvideo", "video/webm"}
+PHOTO_MIME_TYPES = {
+    "image/jpeg", "image/jpg", "image/png", "image/webp",
+    "image/gif", "image/heic", "image/heif", "image/avif",
+    "image/tiff", "image/bmp",
+}
+VIDEO_MIME_TYPES = {
+    "video/mp4", "video/quicktime", "video/x-msvideo", "video/webm",
+    "video/x-matroska", "video/3gpp", "video/3gpp2", "video/mpeg",
+    "video/ogg", "video/x-flv", "video/x-ms-wmv", "video/mp2t",
+    "video/x-m4v",
+}
 
 MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024
 

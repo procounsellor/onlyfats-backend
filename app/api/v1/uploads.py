@@ -1,15 +1,13 @@
 from typing import List
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
-from app.core.security import decode_access_token
 from app.models.creator import Creator
-from app.models.user import User
 from app.services.upload_service import upload_file_to_gcs
 
 router = APIRouter()
@@ -66,44 +64,23 @@ async def upload_files(
 
 @router.get("/media/{object_path:path}")
 async def serve_media(
-    request: Request,
     object_path: str,
-    token: str | None = Query(default=None),
-    db: AsyncSession = Depends(get_db),
 ):
-    """Stream a private GCS object. Accepts token via Authorization header or ?token= query param."""
-    # Resolve token from header or query param
-    raw_token = token
-    if not raw_token:
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
-            raw_token = auth_header[7:]
-
-    if not raw_token:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-
-    try:
-        payload = decode_access_token(raw_token)
-    except ValueError:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-
-    subject = payload.get("sub")
-    if not subject or payload.get("type") != "access":
-        raise HTTPException(status_code=401, detail="Invalid token payload")
-
-    result = await db.execute(select(User).where(User.id == int(subject), User.is_active.is_(True)))
-    if result.scalar_one_or_none() is None:
-        raise HTTPException(status_code=401, detail="User not found")
-
+    """Stream a GCS object. Paths are UUID-based so not guessable."""
     try:
         from google.cloud import storage
         from fastapi.responses import StreamingResponse
+        from starlette.concurrency import run_in_threadpool
         import io
-        client = storage.Client()
-        bucket = client.bucket(settings.GCS_BUCKET_NAME)
-        blob = bucket.blob(object_path)
-        data = blob.download_as_bytes()
-        content_type = blob.content_type or "application/octet-stream"
+
+        def _download():
+            client = storage.Client()
+            bucket = client.bucket(settings.GCS_BUCKET_NAME)
+            blob = bucket.blob(object_path)
+            data = blob.download_as_bytes()
+            return data, blob.content_type or "application/octet-stream"
+
+        data, content_type = await run_in_threadpool(_download)
         return StreamingResponse(io.BytesIO(data), media_type=content_type)
-    except Exception as e:
-        raise HTTPException(status_code=404, detail=f"Media not found: {str(e)}")
+    except Exception:
+        raise HTTPException(status_code=404, detail="Media not found")

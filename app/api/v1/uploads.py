@@ -1,8 +1,12 @@
+import re
+from datetime import timedelta
 from typing import List
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import RedirectResponse, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.concurrency import run_in_threadpool
 
 from app.core.config import settings
 from app.core.database import get_db
@@ -63,24 +67,77 @@ async def upload_files(
 
 
 @router.get("/media/{object_path:path}")
-async def serve_media(
-    object_path: str,
-):
-    """Stream a GCS object. Paths are UUID-based so not guessable."""
+async def serve_media(object_path: str, request: Request):
+    """
+    Serve a GCS object with range-request support for fast video streaming.
+    Tries a signed-URL redirect first (browser streams directly from GCS CDN).
+    Falls back to range-aware proxy if signing is unavailable.
+    """
+    from google.cloud import storage
+
+    def _load_blob():
+        client = storage.Client()
+        bucket = client.bucket(settings.GCS_BUCKET_NAME)
+        blob = bucket.blob(object_path)
+        blob.reload()
+        return blob, blob.content_type or "application/octet-stream", blob.size
+
     try:
-        from google.cloud import storage
-        from fastapi.responses import StreamingResponse
-        from starlette.concurrency import run_in_threadpool
-        import io
-
-        def _download():
-            client = storage.Client()
-            bucket = client.bucket(settings.GCS_BUCKET_NAME)
-            blob = bucket.blob(object_path)
-            data = blob.download_as_bytes()
-            return data, blob.content_type or "application/octet-stream"
-
-        data, content_type = await run_in_threadpool(_download)
-        return StreamingResponse(io.BytesIO(data), media_type=content_type)
+        blob, content_type, total_size = await run_in_threadpool(_load_blob)
     except Exception:
         raise HTTPException(status_code=404, detail="Media not found")
+
+    # ── Try signed-URL redirect (browser streams directly from GCS CDN) ──────
+    def _signed_url():
+        return blob.generate_signed_url(
+            expiration=timedelta(hours=1),
+            method="GET",
+            version="v4",
+        )
+
+    try:
+        signed_url = await run_in_threadpool(_signed_url)
+        return RedirectResponse(url=signed_url, status_code=302)
+    except Exception:
+        pass  # signing not available — fall through to range proxy
+
+    # ── Range-aware proxy fallback ────────────────────────────────────────────
+    range_header = request.headers.get("range")
+
+    if range_header and total_size:
+        m = re.match(r"bytes=(\d+)-(\d*)", range_header)
+        if m:
+            start = int(m.group(1))
+            end = int(m.group(2)) if m.group(2) else total_size - 1
+            end = min(end, total_size - 1)
+
+            def _download_range():
+                return blob.download_as_bytes(start=start, end=end)
+
+            data = await run_in_threadpool(_download_range)
+            return Response(
+                content=data,
+                status_code=206,
+                media_type=content_type,
+                headers={
+                    "Content-Range": f"bytes {start}-{end}/{total_size}",
+                    "Accept-Ranges": "bytes",
+                    "Content-Length": str(len(data)),
+                    "Cache-Control": "private, max-age=3600",
+                },
+            )
+
+    # Full file (images / small files)
+    def _download_all():
+        return blob.download_as_bytes()
+
+    data = await run_in_threadpool(_download_all)
+    return Response(
+        content=data,
+        media_type=content_type,
+        headers={
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(total_size),
+            "Cache-Control": "private, max-age=3600",
+        },
+    )
